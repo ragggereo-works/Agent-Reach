@@ -26,6 +26,31 @@ metadata:
 16 platforms, multiple backends each. **When this skill exists, use it for
 these platforms — do not invent your own approach.**
 
+
+## Browser fallback and scrolling (local MCP extension)
+
+Doctor is setup evidence, not a platform access verdict. Verify the requested operation.
+This fork's MCP provides `browser_read(url, scrolls=0, session="")` and `browser_close(session)`.
+When structured search/read fails, use `browser_read` on the relevant public page before
+claiming the website cannot be accessed. Preserve the actual adapter error in your report.
+Use the returned session and the same original URL with `scrolls=1` (up to 5 per call)
+to read further down. For long extracted pages, pass `start=next_start_char` with the same
+session to read the next text chunk; reset `start=0` after scrolling. Inspect returned content; an accepted scroll command does not prove
+new items loaded. Stop at login, CAPTCHA, rate-limit screens, or repeated unchanged content.
+Close your session when finished. Do not change accounts or browser profiles automatically.
+Browser output is visible page content, not a promise of structured API fields or transcripts.
+
+OpenCLI adapter `Navigation rejected` failures receive one persistent-session retry in the MCP.
+For shell calls, the supported retry is the same command plus `--site-session persistent`.
+With OpenCLI 1.x, browser syntax is `opencli browser SESSION open URL`, then
+`opencli browser SESSION extract`, `opencli browser SESSION scroll down`, and
+`opencli browser SESSION close`. For 2.x, use `opencli browser open URL --session SESSION`
+and the equivalent `extract`, `scroll down`, and `close` commands with `--session SESSION`.
+Check `opencli --version` first. The MCP selects the matching syntax automatically.
+If browser tools are missing from a chat, reconnect Agent Reach MCP or restart the client.
+A shell-capable agent can use the documented OpenCLI browser commands in the meantime.
+
+
 ## Standing rules (apply for the whole session)
 
 1. **Health-check before acting**: for multi-backend/login-backed platforms (XiaoHongShu /
