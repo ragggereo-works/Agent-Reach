@@ -89,7 +89,7 @@ class TestOpenCLISiteChannels:
         status, msg = ch.check()
         assert status == "off"
         assert ch.active_backend is None
-        assert "agent-reach install --channels opencli" in msg
+        assert "agent-reach install --system --channels opencli" in msg
         assert "instagram.com" in msg
 
     def test_opencli_installed_without_extension_reports_warn(self, monkeypatch):
@@ -127,7 +127,7 @@ class TestV2EXChannel:
             def __exit__(self, *args):
                 pass
 
-            def read(self):
+            def read(self, _size=-1):
                 return b"[]"
 
         monkeypatch.setattr(
@@ -227,7 +227,7 @@ class TestV2EXChannel:
             def __exit__(self, *_):
                 pass
 
-            def read(self):
+            def read(self, _size=-1):
                 return json.dumps(fake_data).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
@@ -252,7 +252,7 @@ class TestV2EXChannel:
         class FakeResponse:
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(fake_data).encode()
+            def read(self, _size=-1): return json.dumps(fake_data).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
         topics = V2EXChannel().get_hot_topics(limit=3)
@@ -270,7 +270,7 @@ class TestV2EXChannel:
         class FakeResponse:
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(fake_data).encode()
+            def read(self, _size=-1): return json.dumps(fake_data).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
         topics = V2EXChannel().get_hot_topics(limit=1)
@@ -298,7 +298,7 @@ class TestV2EXChannel:
         class FakeResponse:
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(fake_data).encode()
+            def read(self, _size=-1): return json.dumps(fake_data).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
         topics = V2EXChannel().get_node_topics("python")
@@ -346,7 +346,7 @@ class TestV2EXChannel:
 
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(self._payload).encode()
+            def read(self, _size=-1): return json.dumps(self._payload).encode()
 
         def fake_urlopen(req, timeout=None):
             url = req.full_url
@@ -385,7 +385,7 @@ class TestV2EXChannel:
             def __init__(self, payload): self._payload = payload
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(self._payload).encode()
+            def read(self, _size=-1): return json.dumps(self._payload).encode()
 
         def fake_urlopen(req, timeout=None):
             if "replies" in req.full_url:
@@ -421,7 +421,7 @@ class TestV2EXChannel:
         class FakeResponse:
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def read(self): return json.dumps(fake_user).encode()
+            def read(self, _size=-1): return json.dumps(fake_user).encode()
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
         user = V2EXChannel().get_user("alice")
@@ -1516,7 +1516,7 @@ class TestLinkedInChannel:
         status, msg = ch.check()
         assert status == "off"
         assert ch.active_backend is None
-        assert "agent-reach install --channels opencli" in msg
+        assert "agent-reach install --system --channels opencli" in msg
 
 
 class TestExaSearchChannel:

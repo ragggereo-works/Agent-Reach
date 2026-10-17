@@ -20,8 +20,10 @@ Tools:
 
 import asyncio
 import json
+import re
 import subprocess
 import sys
+import uuid
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -29,6 +31,7 @@ from agent_reach.channels import ALL_CHANNELS
 from agent_reach.config import Config
 from agent_reach.core import AgentReach
 from agent_reach.utils.text import scrub_url_credentials
+from agent_reach.utils.url import normalize_public_http_url
 
 try:
     from mcp.server import Server
@@ -42,7 +45,7 @@ except ImportError:
 # Platforms exposed by the `search` tool. Commands mirror SKILL.md —
 # zero-config first, login-required platforms surface doctor hints on failure.
 SEARCH_PLATFORMS = (
-    "web", "twitter", "reddit", "instagram", "tiktok", "linkedin",
+    "web", "twitter", "reddit", "facebook", "instagram", "tiktok", "linkedin",
     "xiaohongshu", "bilibili", "github", "youtube",
 )
 
@@ -80,8 +83,8 @@ def build_search_command(platform: str, query: str, limit: int = 5) -> Tuple[Lis
         return (["twitter", "search", query, "-n", str(limit)], _DEFAULT_TIMEOUT)
     if platform == "reddit":
         return (["opencli", "reddit", "search", query, "-f", "yaml"], _DEFAULT_TIMEOUT)
-    if platform == "instagram":
-        return (["opencli", "instagram", "search", query, "-f", "yaml"], _DEFAULT_TIMEOUT)
+    if platform in {"instagram", "facebook"}:
+        return (["opencli", platform, "search", query, "-f", "yaml"], _DEFAULT_TIMEOUT)
     if platform == "tiktok":
         return (["opencli", "tiktok", "search", query, "--limit", str(limit),
                  "-f", "yaml"], _DEFAULT_TIMEOUT)
@@ -276,27 +279,126 @@ def _clip(text: str) -> str:
     return text
 
 
+def run_platform_command(cmd: List[str], timeout: int) -> Tuple[bool, str]:
+    """Retry the observed OpenCLI session failure once using its public option."""
+    ok, output = run_upstream(cmd, timeout)
+    if (not ok and cmd[0] == "opencli" and "Navigation rejected" in output
+            and "--site-session" not in cmd):
+        return run_upstream([*cmd, "--site-session", "persistent"], timeout)
+    return ok, output
+
+
 def do_search(query: str, platform: str = "web", limit: int = 5) -> str:
     cmd, timeout = build_search_command(platform, query, limit)
-    ok, output = run_upstream(cmd, timeout)
+    ok, output = run_platform_command(cmd, timeout)
     if not ok and output.startswith("MISSING_TOOL:") and platform in OPENCLI_SEARCH_FALLBACKS:
-        ok, output = run_upstream(OPENCLI_SEARCH_FALLBACKS[platform](query, limit), timeout)
-    return _clip(output) if ok else output.replace("MISSING_TOOL:", "", 1)
+        ok, output = run_platform_command(OPENCLI_SEARCH_FALLBACKS[platform](query, limit), timeout)
+    return _clip(output) if ok else (
+        output.replace("MISSING_TOOL:", "", 1)
+        + "\nFor visible page content, use browser_read(url); it supports continued scrolling. "
+          "Report login/captcha/rate-limit screens as blockers, not successful content."
+    )
 
 
 def do_read(url: str) -> str:
     platform, cmd, timeout = build_read_command(url)
-    ok, output = run_upstream(cmd, timeout)
+    ok, output = run_platform_command(cmd, timeout)
     if not ok and output.startswith("MISSING_TOOL:") and platform in OPENCLI_READ_FALLBACKS:
-        ok, output = run_upstream(OPENCLI_READ_FALLBACKS[platform](url), timeout)
+        ok, output = run_platform_command(OPENCLI_READ_FALLBACKS[platform](url), timeout)
     if ok and platform == "youtube":
         output = _trim_youtube_json(output)
-    return _clip(output) if ok else output.replace("MISSING_TOOL:", "", 1)
+    return _clip(output) if ok else (
+        output.replace("MISSING_TOOL:", "", 1)
+        + "\nFor visible page content, use browser_read(url); it supports continued scrolling. "
+          "Report login/captcha/rate-limit screens as blockers, not successful content."
+    )
+
+
+def do_browser_read(url: str, scrolls: int = 0, session: str = "", start: int = 0) -> str:
+    """Read visible browser content via public OpenCLI commands, optionally scrolling.
+
+    A fresh named session isolates each read. Continue only sessions created by
+    this server, so another chat cannot accidentally scroll an unrelated tab.
+    No arbitrary JS, clicks, account changes, or login automation is exposed.
+    """
+    url = normalize_public_http_url(url)
+    scrolls = int(scrolls)
+    start = int(start)
+    if not 0 <= start <= 2_000_000:
+        raise ValueError("start must be between 0 and 2000000")
+    if not 0 <= scrolls <= 5:
+        raise ValueError("scrolls must be between 0 and 5")
+    if session:
+        if not re.fullmatch(r"reach-[0-9a-f]{32}", session) or session not in _BROWSER_SESSIONS:
+            raise ValueError("Use a session returned by browser_read in this server")
+        if _BROWSER_SESSIONS[session] != url:
+            raise ValueError("A continuation must use the original session URL")
+    else:
+        if len(_BROWSER_SESSIONS) >= 20:
+            raise ValueError("Close an existing browser session before opening another")
+        session = "reach-" + uuid.uuid4().hex
+        ok, output = run_upstream(_browser_command(session, "open", url), _DEFAULT_TIMEOUT)
+        if not ok:
+            return output
+        _BROWSER_SESSIONS[session] = url
+    for _ in range(scrolls):
+        ok, output = run_upstream(_browser_command(session, "scroll", "down"), _DEFAULT_TIMEOUT)
+        if not ok:
+            return json.dumps({"session": session, "error": output})
+    args = ("--start", str(start)) if start else ()
+    ok, output = run_upstream(_browser_command(session, "extract", *args), _DEFAULT_TIMEOUT)
+    result = {"session": session, "url": url, "ok": ok,
+              "source": "visible browser page; not structured platform API"}
+    try:
+        extracted = json.loads(output)
+        if isinstance(extracted, dict) and isinstance(extracted.get("data"), dict):
+            extracted = extracted["data"]
+        if isinstance(extracted, dict) and "content" in extracted:
+            result.update({k: extracted.get(k) for k in
+                           ("title", "next_start_char", "total_chars", "start", "end")})
+            result["rendered_url"] = extracted.get("url")
+            output = str(extracted["content"])
+    except (ValueError, TypeError):
+        pass
+    result["content"] = _clip(output)
+    if not output.strip():
+        result["ok"] = False
+        result["error"] = "No readable content extracted; inspect login/consent or page-loading state."
+    return json.dumps(result, ensure_ascii=False)
+
+
+_BROWSER_SESSIONS: dict[str, str] = {}
+
+
+def _browser_command(session: str, action: str, *args: str) -> List[str]:
+    ok, version = run_upstream(["opencli", "--version"], 10)
+    if not ok:
+        raise RuntimeError(version)
+    match = re.search(r"(?:^|\n)(\d+)\.", version)
+    if not match:
+        raise RuntimeError("Unable to determine OpenCLI browser command version")
+    if int(match.group(1)) >= 2:
+        return ["opencli", "browser", action, *args, "--session", session]
+    return ["opencli", "browser", session, action, *args]
+
+
+def do_browser_close(session: str) -> str:
+    if session not in _BROWSER_SESSIONS:
+        raise ValueError("Unknown Agent Reach browser session")
+    ok, output = run_upstream(_browser_command(session, "close"), _DEFAULT_TIMEOUT)
+    if ok:
+        del _BROWSER_SESSIONS[session]
+    return output
 
 
 def create_server():
     if not HAS_MCP:
-        print("MCP not installed. Install: pip install agent-reach[mcp]", file=sys.stderr)
+        print(
+            "MCP not installed. Install: python -m pip install "
+            "'agent-reach[mcp] @ "
+            "https://github.com/Panniantong/agent-reach/archive/main.zip'",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     server = Server("agent-reach")
@@ -306,8 +408,26 @@ def create_server():
     @server.list_tools()
     async def list_tools():
         return [
+            Tool(name="browser_read",
+                 description=("Read a public website in the connected browser and optionally scroll "
+                              "down 0-5 times. Use when a platform adapter fails or more visible "
+                              "content is needed. Reuse the returned session and original URL to "
+                              "continue scrolling. Login/captcha screens are blockers, not content. "
+                              "Close the session with browser_close when done."),
+                 inputSchema={"type": "object", "properties": {
+                     "url": {"type": "string"},
+                     "scrolls": {"type": "integer", "minimum": 0, "maximum": 5, "default": 0},
+                     "session": {"type": "string", "description": "Returned session for continuation"},
+                     "start": {"type": "integer", "minimum": 0, "maximum": 2000000,
+                               "description": "Use next_start_char to read the rest of a long page; reset to 0 after scrolling"},
+                 }, "required": ["url"]}),
+            Tool(name="browser_close", description="Release an Agent Reach browser_read session.",
+                 inputSchema={"type": "object", "properties": {"session": {"type": "string"}},
+                              "required": ["session"]}),
             Tool(name="get_status",
-                 description="Get Agent Reach status: which channels are installed and active.",
+                 description=("Setup diagnostics only, not a live availability test. A warning or "
+                              "null active_backend does not prove a platform is inaccessible. "
+                              "Verify the requested operation with search/read/browser_read."),
                  inputSchema={"type": "object", "properties": {}}),
             Tool(name="search",
                  description=(
@@ -317,7 +437,8 @@ def create_server():
                      "searches JOBS, not people or posts. Login-required "
                      "platforms (twitter, reddit, instagram, tiktok, "
                      "linkedin, xiaohongshu) reuse your browser session — "
-                     "check get_status if they fail."
+                     "If an adapter fails, use browser_read for visible page content and scrolling; "
+                     "get_status is setup evidence, not a live platform test."
                  ),
                  inputSchema={
                      "type": "object",
@@ -350,7 +471,14 @@ def create_server():
     @server.call_tool()
     async def call_tool(name: str, arguments: dict):
         try:
-            if name == "get_status":
+            if name == "browser_read":
+                result = await asyncio.to_thread(
+                    do_browser_read, arguments["url"], arguments.get("scrolls", 0),
+                    arguments.get("session", ""), arguments.get("start", 0),
+                )
+            elif name == "browser_close":
+                result = await asyncio.to_thread(do_browser_close, arguments["session"])
+            elif name == "get_status":
                 result = eyes.doctor_report()
             elif name == "search":
                 result = await asyncio.to_thread(

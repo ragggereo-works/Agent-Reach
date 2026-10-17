@@ -420,3 +420,103 @@ def test_mcp_status_exception_credentials_are_scrubbed(monkeypatch):
     assert "password" not in text
     assert "top-secret" not in text
     assert "https://***@example.test/data?token=***" in text
+
+@pytest.fixture
+def browser_calls(monkeypatch):
+    calls = []
+    mcp_server._BROWSER_SESSIONS.clear()
+    def run(cmd, timeout):
+        calls.append(cmd)
+        return True, '1.8.5' if cmd == ['opencli', '--version'] else '{"content":"visible posts"}'
+    monkeypatch.setattr(mcp_server, 'run_upstream', run)
+    yield calls
+    mcp_server._BROWSER_SESSIONS.clear()
+
+
+def test_browser_continues_original_session_and_closes(browser_calls):
+    first = json.loads(mcp_server.do_browser_read('https://www.instagram.com/nasa/'))
+    session = first['session']
+    second = json.loads(mcp_server.do_browser_read(first['url'], 2, session))
+    assert second['session'] == session
+    assert sum('open' in c for c in browser_calls) == 1
+    assert sum('scroll' in c for c in browser_calls) == 2
+    mcp_server.do_browser_close(session)
+    assert session not in mcp_server._BROWSER_SESSIONS
+
+
+@pytest.mark.parametrize('url', ['file:///etc/passwd', 'http://127.0.0.1', 'https://user:password@example.com'])
+def test_browser_rejects_non_public_urls(browser_calls, url):
+    with pytest.raises(ValueError):
+        mcp_server.do_browser_read(url)
+    assert not browser_calls
+
+
+def test_browser_rejects_unknown_sessions_and_excess_scroll(browser_calls):
+    with pytest.raises(ValueError):
+        mcp_server.do_browser_read('https://example.com', session='other-chat')
+    with pytest.raises(ValueError):
+        mcp_server.do_browser_read('https://example.com', scrolls=6)
+    assert not browser_calls
+
+
+def test_browser_navigation_failure_is_not_registered(monkeypatch):
+    mcp_server._BROWSER_SESSIONS.clear()
+    monkeypatch.setattr(mcp_server, '_browser_command', lambda *a: list(a))
+    monkeypatch.setattr(mcp_server, 'run_upstream', lambda *a: (False, 'Navigation rejected'))
+    assert mcp_server.do_browser_read('https://example.com') == 'Navigation rejected'
+    assert not mcp_server._BROWSER_SESSIONS
+
+
+def test_browser_v2_command_contract(monkeypatch):
+    monkeypatch.setattr(mcp_server, 'run_upstream', lambda *a: (True, '2.0.0'))
+    assert mcp_server._browser_command('reach-test', 'open', 'https://example.com') == [
+        'opencli', 'browser', 'open', 'https://example.com', '--session', 'reach-test']
+
+
+def test_navigation_rejected_retries_persistent_once(monkeypatch):
+    calls = []
+    def run(cmd, timeout):
+        calls.append(cmd)
+        return (True, 'results') if '--site-session' in cmd else (False, 'Navigation rejected')
+    monkeypatch.setattr(mcp_server, 'run_upstream', run)
+    assert mcp_server.do_search('python', 'xiaohongshu') == 'results'
+    assert len(calls) == 2
+    assert calls[1][-2:] == ['--site-session', 'persistent']
+
+
+def test_rate_limit_is_not_retried(monkeypatch):
+    calls = []
+    def run(cmd, timeout):
+        calls.append(cmd)
+        return False, 'HTTP 429'
+    monkeypatch.setattr(mcp_server, 'run_upstream', run)
+    assert 'browser_read' in mcp_server.do_search('nasa', 'instagram')
+    assert len(calls) == 1
+
+
+def test_facebook_search_is_exposed():
+    assert 'facebook' in SEARCH_PLATFORMS
+    assert build_search_command('facebook', 'NASA')[0] == [
+        'opencli', 'facebook', 'search', 'NASA', '-f', 'yaml']
+
+
+def test_browser_long_page_pagination(monkeypatch, browser_calls):
+    session = json.loads(mcp_server.do_browser_read('https://example.com'))['session']
+    def run(cmd, timeout):
+        if cmd == ['opencli', '--version']:
+            return True, '2.0.0'
+        assert cmd[2:5] == ['extract', '--start', '20000']
+        return True, json.dumps({'ok': True, 'data': {'content': 'second chunk', 'next_start_char': 40000}})
+    monkeypatch.setattr(mcp_server, 'run_upstream', run)
+    result = json.loads(mcp_server.do_browser_read('https://example.com', session=session, start=20000))
+    assert result['content'] == 'second chunk'
+    assert result['next_start_char'] == 40000
+
+
+def test_empty_browser_content_is_not_success(monkeypatch, browser_calls):
+    session = json.loads(mcp_server.do_browser_read('https://example.com'))['session']
+    monkeypatch.setattr(mcp_server, 'run_upstream', lambda cmd, timeout: (
+        True, '1.8.5' if cmd == ['opencli', '--version'] else '{"content":""}'))
+    result = json.loads(mcp_server.do_browser_read('https://example.com', session=session))
+    assert result['ok'] is False
+    assert 'No readable content' in result['error']
